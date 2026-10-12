@@ -1,281 +1,191 @@
-#include "Renderer.hpp"
+// metal-cpp is header-only; this file provides its implementation.
+#define NS_PRIVATE_IMPLEMENTATION
+#define MTL_PRIVATE_IMPLEMENTATION
+#include "renderer.hpp"
 
-#include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
 
-#include "Math.hpp"
-#include "Mesh.hpp"
+#include <cmath>
+#include <stdexcept>
 
-const int Renderer::kMaxFramesInFlight = 3;
+namespace {
 
-Renderer::Renderer(MTL::Device* pDevice)
-    : _pDevice(pDevice->retain()), _angle(0.f), _frame(0) {
-  _pCommandQueue = _pDevice->newCommandQueue();
-  buildShaders();
-  buildDepthStencilStates();
-  buildBuffers();
+// The shader sources, baked into the binary by the Makefile.
+const char* kShaderSource =
+#include "shaders.inc"
+    ;
 
-  _semaphore = dispatch_semaphore_create(Renderer::kMaxFramesInFlight);
+// Same visible-normal sampling as the shader.
+float3 visibleNormal(float3 wo, float alpha, float u1, float u2) {
+  float3 w   = simd::normalize(float3{wo.x * alpha, wo.y * alpha, wo.z});
+  float  phi = 2 * M_PI * u1, z = (1 - u2) * (1 + w.z) - w.z, s = std::sqrt(std::max(0.f, 1 - z * z));
+  float3 h = float3{s * std::cos(phi), s * std::sin(phi), z} + w;
+  return simd::normalize(float3{h.x * alpha, h.y * alpha, std::max(h.z, 1e-6f)});
 }
 
-Renderer::~Renderer() {
-  _pShaderLibrary->release();
-  _pDepthStencilState->release();
-  _pVertexDataBuffer->release();
-  for (int i = 0; i < kMaxFramesInFlight; ++i) {
-    _pInstanceDataBuffer[i]->release();
-  }
-  for (int i = 0; i < kMaxFramesInFlight; ++i) {
-    _pCameraDataBuffer[i]->release();
-  }
-  _pIndexBuffer->release();
-  _pPSO->release();
-  _pCommandQueue->release();
-  _pDevice->release();
-}
-
-void Renderer::buildDepthStencilStates() {
-  MTL::DepthStencilDescriptor* pDsDesc =
-      MTL::DepthStencilDescriptor::alloc()->init();
-  pDsDesc->setDepthCompareFunction(MTL::CompareFunction::CompareFunctionLess);
-  pDsDesc->setDepthWriteEnabled(true);
-
-  _pDepthStencilState = _pDevice->newDepthStencilState(pDsDesc);
-
-  pDsDesc->release();
-}
-
-void Renderer::buildShaders() {
-  using NS::StringEncoding::UTF8StringEncoding;
-
-  std::filesystem::path shaderPath =
-      std::filesystem::current_path().parent_path() / "src" / "shader.metal";
-
-  std::string   shaderPathStr = shaderPath.string();
-  std::ifstream shaderFile(shaderPathStr);
-  if (!shaderFile.is_open()) {
-    __builtin_printf(
-        "Failed to open Shader.metal at path: %s\n", shaderPathStr.c_str());
-    assert(false);
-  }
-
-  std::stringstream shaderSrcStream;
-  shaderSrcStream << shaderFile.rdbuf();
-  shaderFile.close();
-  std::string shaderSrcStr = shaderSrcStream.str();
-  NS::String* shaderSrc    = NS::String::string(
-      shaderSrcStr.c_str(), UTF8StringEncoding);
-  if (!shaderSrc) {
-    __builtin_printf("Failed to create NS::String from shader source\n");
-    assert(false);
-  }
-
-  NS::Error*    pError   = nullptr;
-  MTL::Library* pLibrary = _pDevice->newLibrary(shaderSrc, nullptr, &pError);
-  if (!pLibrary) {
-    __builtin_printf("%s", pError->localizedDescription()->utf8String());
-    assert(false);
-  }
-
-  MTL::Function* pVertexFn = pLibrary->newFunction(
-      NS::String::string("vertexMain", UTF8StringEncoding));
-  MTL::Function* pFragFn = pLibrary->newFunction(
-      NS::String::string("fragmentMain", UTF8StringEncoding));
-
-  MTL::RenderPipelineDescriptor* pDesc =
-      MTL::RenderPipelineDescriptor::alloc()->init();
-  pDesc->setVertexFunction(pVertexFn);
-  pDesc->setFragmentFunction(pFragFn);
-  pDesc->colorAttachments()->object(0)->setPixelFormat(
-      MTL::PixelFormat::PixelFormatBGRA8Unorm_sRGB);
-  pDesc->setDepthAttachmentPixelFormat(
-      MTL::PixelFormat::PixelFormatDepth16Unorm);
-
-  _pPSO = _pDevice->newRenderPipelineState(pDesc, &pError);
-  if (!_pPSO) {
-    __builtin_printf("%s", pError->localizedDescription()->utf8String());
-    assert(false);
-  }
-
-  pVertexFn->release();
-  pFragFn->release();
-  pDesc->release();
-  _pShaderLibrary = pLibrary;
-}
-
-void Renderer::buildBuffers() {
-  auto mesh = createMesh(MeshType::Sphere);
-
-  auto vertices = mesh->getVertices();
-  auto indices  = mesh->getIndices();
-
-  _numIndices                 = indices.size();
-  const size_t vertexDataSize = vertices.size() *
-                                sizeof(shader_types::VertexData);
-  const size_t indexDataSize = indices.size() * sizeof(uint16_t);
-
-  _pVertexDataBuffer = _pDevice->newBuffer(
-      vertexDataSize, MTL::ResourceStorageModeManaged);
-  _pIndexBuffer = _pDevice->newBuffer(
-      indexDataSize, MTL::ResourceStorageModeManaged);
-
-  memcpy(_pVertexDataBuffer->contents(), vertices.data(), vertexDataSize);
-  memcpy(_pIndexBuffer->contents(), indices.data(), indexDataSize);
-
-  _pVertexDataBuffer->didModifyRange(NS::Range::Make(0, vertexDataSize));
-  _pIndexBuffer->didModifyRange(NS::Range::Make(0, indexDataSize));
-
-  const size_t instanceDataSize = kMaxFramesInFlight * kNumInstances *
-                                  sizeof(shader_types::InstanceData);
-  for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
-    _pInstanceDataBuffer[i] = _pDevice->newBuffer(
-        instanceDataSize, MTL::ResourceStorageModeManaged);
-  }
-
-  const size_t cameraDataSize = kMaxFramesInFlight *
-                                sizeof(shader_types::CameraData);
-  for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
-    _pCameraDataBuffer[i] = _pDevice->newBuffer(
-        cameraDataSize, MTL::ResourceStorageModeManaged);
-  }
-
-  const size_t lightDataSize = kMaxFramesInFlight *
-                               sizeof(shader_types::LightData);
-  for (size_t i = 0; i < kMaxFramesInFlight; ++i) {
-    _pLightDataBuffer[i] = _pDevice->newBuffer(
-        lightDataSize, MTL::ResourceStorageModeManaged);
-  }
-}
-
-void Renderer::updateLightData(MTL::Buffer* pLightBuffer) {
-  shader_types::LightData* pLightData =
-      reinterpret_cast<shader_types::LightData*>(pLightBuffer->contents());
-
-  pLightData->position = {
-      5.0f * sinf(_currentTime), 5.0f, 5.0f * cosf(_currentTime)};
-  pLightData->color      = {1.0f, 0.9f, 0.8f};
-  pLightData->intensity  = 2.0f;
-  pLightData->range      = 30.0f;
-  pLightData->pulseSpeed = 2.0f;
-  pLightData->time       = _currentTime;
-
-  pLightBuffer->didModifyRange(
-      NS::Range::Make(0, sizeof(shader_types::LightData)));
-}
-
-void Renderer::draw(MTK::View* pView) {
-  using simd::float3;
-  using simd::float4;
-  using simd::float4x4;
-
-  NS::AutoreleasePool* pPool = NS::AutoreleasePool::alloc()->init();
-
-  _frame = (_frame + 1) % Renderer::kMaxFramesInFlight;
-  MTL::Buffer* pInstanceDataBuffer = _pInstanceDataBuffer[_frame];
-  MTL::Buffer* pLightDataBuffer    = _pLightDataBuffer[_frame];
-
-  MTL::CommandBuffer* pCmd = _pCommandQueue->commandBuffer();
-  dispatch_semaphore_wait(_semaphore, DISPATCH_TIME_FOREVER);
-  Renderer* pRenderer = this;
-  pCmd->addCompletedHandler(^void(MTL::CommandBuffer* pCmd) {
-    dispatch_semaphore_signal(pRenderer->_semaphore);
-  });
-
-  _currentTime += 0.016f;
-  _angle += 0.002f;
-
-  const float                 scl = 0.2f;
-  shader_types::InstanceData* pInstanceData =
-      reinterpret_cast<shader_types::InstanceData*>(
-          pInstanceDataBuffer->contents());
-
-  float3 objectPosition = {0.f, 0.f, -10.f};
-
-  float4x4 rt    = Math::makeTranslate(objectPosition);
-  float4x4 rr1   = Math::makeYRotate(-_angle);
-  float4x4 rr0   = Math::makeXRotate(_angle * 0.5);
-  float4x4 rtInv = Math::makeTranslate(
-      {-objectPosition.x, -objectPosition.y, -objectPosition.z});
-  float4x4 fullObjectRot = rt * rr1 * rr0 * rtInv;
-
-  size_t ix = 0;
-  size_t iy = 0;
-  size_t iz = 0;
-  for (size_t i = 0; i < kNumInstances; ++i) {
-    if (ix == kInstanceRows) {
-      ix = 0;
-      iy += 1;
+// Average reflectance of a white GGX metal per (roughness, cosθ). The shader uses
+// it to add back the energy that single-scattering microfacet models lose.
+std::vector<float> ggxAlbedoTable() {
+  const int          n = kAlbedoTableSize, strata = 48;
+  std::vector<float> table(n * n);
+  for (int row = 0; row < n; ++row)
+    for (int col = 0; col < n; ++col) {
+      float  roughness = float(row) / (n - 1), alpha = std::max(roughness * roughness, 1e-3f), a2 = alpha * alpha;
+      float  c = std::max(float(col) / (n - 1), 1e-3f);
+      float3 wo{std::sqrt(1 - c * c), 0, c};
+      auto   lambda = [&](float z) { return std::sqrt(a2 + (1 - a2) * z * z); };
+      double sum    = 0;
+      for (int i = 0; i < strata; ++i)
+        for (int j = 0; j < strata; ++j) {
+          float3 h  = visibleNormal(wo, alpha, (i + 0.5f) / strata, (j + 0.5f) / strata);
+          float3 wi = 2 * simd::dot(wo, h) * h - wo;
+          if (wi.z > 0) sum += wi.z * (c + lambda(c)) / (wi.z * lambda(c) + c * lambda(wi.z));  // G2 / G1
+        }
+      table[row * n + col] = float(sum / (strata * strata));
     }
-    if (iy == kInstanceRows) {
-      iy = 0;
-      iz += 1;
-    }
+  return table;
+}
 
-    float4x4 scale = Math::makeScale((float3){scl, scl, scl});
-    float4x4 zrot  = Math::makeZRotate(_angle * sinf((float)ix));
-    float4x4 yrot  = Math::makeYRotate(_angle * cosf((float)iy));
+template <typename T>
+NS::SharedPtr<MTL::Buffer> upload(MTL::Device* device, const std::vector<T>& data) {
+  return NS::TransferPtr(
+      device->newBuffer(data.data(), std::max<size_t>(data.size(), 1) * sizeof(T), MTL::ResourceStorageModeShared));
+}
 
-    float x = ((float)ix - (float)kInstanceRows / 2.f) * (2.f * scl) + scl;
-    float y = ((float)iy - (float)kInstanceColumns / 2.f) * (2.f * scl) + scl;
-    float z = ((float)iz - (float)kInstanceDepth / 2.f) * (2.f * scl);
-    float4x4 translate = Math::makeTranslate(
-        Math::add(objectPosition, {x, y, z}));
+}  // namespace
 
-    pInstanceData[i].instanceTransform = fullObjectRot * translate * yrot *
-                                         zrot * scale;
-    pInstanceData[i].instanceNormalTransform = Math::discardTranslation(
-        pInstanceData[i].instanceTransform);
+Renderer::Renderer(MTL::Device* device)
+    : _device(NS::RetainPtr(device)), _queue(NS::TransferPtr(device->newCommandQueue())) {
+  NS::Error* error   = nullptr;
+  auto       library = NS::TransferPtr(
+      device->newLibrary(NS::String::string(kShaderSource, NS::UTF8StringEncoding), nullptr, &error));
+  if (!library) throw std::runtime_error(error->localizedDescription()->utf8String());
+  auto function = [&](const char* name) {
+    return NS::TransferPtr(library->newFunction(NS::String::string(name, NS::UTF8StringEncoding)));
+  };
 
-    float iDivNumInstances         = i / (float)kNumInstances;
-    float r                        = iDivNumInstances;
-    float g                        = 1.0f - r;
-    float b                        = sinf(M_PI * 2.0f * iDivNumInstances);
-    pInstanceData[i].instanceColor = (float4){r, g, b, 1.0f};
+  _tracePipeline   = NS::TransferPtr(device->newComputePipelineState(function("pathTrace").get(), &error));
+  _resolvePipeline = NS::TransferPtr(device->newComputePipelineState(function("resolve").get(), &error));
 
-    ix += 1;
+  auto desc = NS::TransferPtr(MTL::RenderPipelineDescriptor::alloc()->init());
+  desc->setVertexFunction(function("blitVertex").get());
+  desc->setFragmentFunction(function("blitFragment").get());
+  desc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm);
+  _presentPipeline = NS::TransferPtr(device->newRenderPipelineState(desc.get(), &error));
+  if (!_tracePipeline || !_resolvePipeline || !_presentPipeline) throw std::runtime_error("failed to create pipelines");
+
+  _albedoTable = upload(device, ggxAlbedoTable());
+}
+
+void Renderer::load(const Scene& scene) {
+  _scene     = &scene;
+  _nodes     = upload(_device.get(), scene.nodes);
+  _triangles = upload(_device.get(), scene.triangles);
+  _shading   = upload(_device.get(), scene.shading);
+  _materials = upload(_device.get(), scene.materials);
+  _lights    = upload(_device.get(), scene.lights);
+  reset();
+}
+
+void Renderer::resize(uint32_t width, uint32_t height) {
+  width = std::max(width, 1u), height = std::max(height, 1u);
+  if (width == _width && height == _height) return;
+  _width = width, _height = height;
+  _accumulation = NS::TransferPtr(_device->newBuffer(size_t(width) * height * 16, MTL::ResourceStorageModePrivate));
+  auto desc     = MTL::TextureDescriptor::texture2DDescriptor(MTL::PixelFormatRGBA8Unorm, width, height, false);
+  desc->setUsage(MTL::TextureUsageShaderRead | MTL::TextureUsageShaderWrite);
+  desc->setStorageMode(MTL::StorageModeShared);
+  _image = NS::TransferPtr(_device->newTexture(desc));
+  reset();
+}
+
+Uniforms Renderer::uniforms(const Camera& cam) const {
+  float3       forward = cam.forward(), right = simd::normalize(simd::cross(forward, float3{0, 1, 0}));
+  float        h = std::tan(cam.fov * float(M_PI) / 360);
+  const Scene& s = *_scene;
+  return {
+      .cameraPosition = cam.position(),
+      .cameraRight    = right * h * float(_width) / float(_height),
+      .cameraUp       = simd::cross(right, forward) * h,
+      .cameraForward  = forward,
+      .skyZenith      = s.skyZenith,
+      .skyHorizon     = s.skyHorizon,
+      .skyGround      = s.skyGround,
+      .resolution     = {_width, _height},
+      .sampleIndex    = _samples,
+      .maxBounces     = maxBounces,
+      .aperture       = cam.aperture,
+      .focusDistance  = cam.focusDistance,
+      .blades         = cam.blades,
+      .lightCount     = uint(s.lights.size()),
+      .lightPower     = s.lightPower,
+      .clamp          = 24,
+      .exposure       = exposure + s.exposure,
+      .hideLights     = uint(s.hideLights),
+  };
+}
+
+void Renderer::trace(MTL::CommandBuffer* cmd, const Camera& camera, uint32_t samples) {
+  if (samples == 0) return;
+  auto enc = cmd->computeCommandEncoder();
+  enc->setComputePipelineState(_tracePipeline.get());
+  MTL::Buffer* buffers[]  = {_accumulation.get(), nullptr, _nodes.get(), _triangles.get(), _shading.get(),
+       _materials.get(), _lights.get(), _albedoTable.get()};
+  NS::UInteger offsets[8] = {};
+  enc->setBuffers(buffers, offsets, NS::Range(0, 8));
+  Uniforms u = uniforms(camera);
+  for (uint32_t i = 0; i < samples; ++i, ++_samples) {
+    u.sampleIndex = _samples;
+    enc->setBytes(&u, sizeof u, 1);
+    enc->dispatchThreads(MTL::Size(_width, _height, 1), MTL::Size(8, 8, 1));
   }
-  pInstanceDataBuffer->didModifyRange(
-      NS::Range::Make(0, pInstanceDataBuffer->length()));
+  enc->endEncoding();
+}
 
-  updateLightData(pLightDataBuffer);
+void Renderer::resolve(MTL::CommandBuffer* cmd) {
+  Uniforms u{.resolution = {_width, _height}, .exposure = exposure + _scene->exposure};
+  auto     enc = cmd->computeCommandEncoder();
+  enc->setComputePipelineState(_resolvePipeline.get());
+  enc->setBuffer(_accumulation.get(), 0, 0);
+  enc->setBytes(&u, sizeof u, 1);
+  enc->setTexture(_image.get(), 0);
+  enc->dispatchThreads(MTL::Size(_width, _height, 1), MTL::Size(16, 16, 1));
+  enc->endEncoding();
+}
 
-  MTL::Buffer*              pCameraDataBuffer = _pCameraDataBuffer[_frame];
-  shader_types::CameraData* pCameraData =
-      reinterpret_cast<shader_types::CameraData*>(
-          pCameraDataBuffer->contents());
-  pCameraData->perspectiveTransform = Math::makePerspective(
-      45.f * M_PI / 180.f, 1.f, 0.03f, 500.0f);
-  pCameraData->worldTransform       = Math::makeIdentity();
-  pCameraData->worldNormalTransform = Math::discardTranslation(
-      pCameraData->worldTransform);
-  pCameraDataBuffer->didModifyRange(
-      NS::Range::Make(0, sizeof(shader_types::CameraData)));
+void Renderer::present(MTL::CommandBuffer* cmd, MTL::Texture* target) {
+  auto pass = MTL::RenderPassDescriptor::renderPassDescriptor();
+  pass->colorAttachments()->object(0)->setTexture(target);
+  pass->colorAttachments()->object(0)->setLoadAction(MTL::LoadActionDontCare);
+  auto enc = cmd->renderCommandEncoder(pass);
+  enc->setRenderPipelineState(_presentPipeline.get());
+  enc->setFragmentTexture(_image.get(), 0);
+  enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+  enc->endEncoding();
+}
 
-  MTL::RenderPassDescriptor* pRpd = pView->currentRenderPassDescriptor();
-  MTL::RenderCommandEncoder* pEnc = pCmd->renderCommandEncoder(pRpd);
+bool Renderer::savePng(const std::string& path) {
+  auto cmd = _queue->commandBuffer();
+  resolve(cmd);
+  cmd->commit();
+  cmd->waitUntilCompleted();
 
-  pEnc->setRenderPipelineState(_pPSO);
-  pEnc->setDepthStencilState(_pDepthStencilState);
+  std::vector<uint8_t> pixels(size_t(_width) * _height * 4);
+  _image->getBytes(pixels.data(), _width * 4, MTL::Region(0, 0, _width, _height), 0);
 
-  pEnc->setVertexBuffer(_pVertexDataBuffer, 0, 0);
-  pEnc->setVertexBuffer(pInstanceDataBuffer, 0, 1);
-  pEnc->setVertexBuffer(pCameraDataBuffer, 0, 2);
-
-  pEnc->setFragmentBuffer(pCameraDataBuffer, 0, 0);
-  pEnc->setFragmentBuffer(pLightDataBuffer, 0, 1);
-
-  pEnc->setCullMode(MTL::CullModeBack);
-  pEnc->setFrontFacingWinding(MTL::Winding::WindingCounterClockwise);
-
-  pEnc->drawIndexedPrimitives(MTL::PrimitiveType::PrimitiveTypeTriangle,
-      _numIndices, MTL::IndexType::IndexTypeUInt16, _pIndexBuffer, 0,
-      kNumInstances);
-
-  pEnc->endEncoding();
-  pCmd->presentDrawable(pView->currentDrawable());
-  pCmd->commit();
-
-  pPool->release();
+  auto url      = CFURLCreateFromFileSystemRepresentation(nullptr, (const UInt8*)path.c_str(), path.size(), false);
+  auto space    = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  auto provider = CGDataProviderCreateWithData(nullptr, pixels.data(), pixels.size(), nullptr);
+  auto image    = CGImageCreate(_width, _height, 8, 32, _width * 4, space, CGBitmapInfo(kCGImageAlphaNoneSkipLast),
+         provider, nullptr, false, kCGRenderingIntentDefault);
+  auto dest     = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr);
+  bool ok       = dest && image;
+  if (ok) {
+    CGImageDestinationAddImage(dest, image, nullptr);
+    ok = CGImageDestinationFinalize(dest);
+  }
+  for (CFTypeRef ref : {(CFTypeRef)dest, (CFTypeRef)image, (CFTypeRef)provider, (CFTypeRef)space, (CFTypeRef)url})
+    if (ref) CFRelease(ref);
+  return ok;
 }
